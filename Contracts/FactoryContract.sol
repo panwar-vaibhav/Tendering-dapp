@@ -1,137 +1,417 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "./TenderContract.sol";
+import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
-contract TenderFactory is 
+/**
+ * @title FactoryContract
+ * @dev Main factory contract for managing tenders, user roles, and platform operations
+ * @notice This contract handles user registration, tender deployment, reputation management,
+ * and stake management for the decentralized tendering platform
+ */
+contract FactoryContract is 
     Initializable, 
     AccessControlUpgradeable, 
     PausableUpgradeable, 
     ReentrancyGuardUpgradeable 
 {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    // Role definitions
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     bytes32 public constant ORGANIZATION_ROLE = keccak256("ORGANIZATION_ROLE");
-    
-    struct TenderMetadata {
-        address organization;
-        uint256 createdAt;
-        string ipfsHash;
-        bool isActive;
+    bytes32 public constant BIDDER_ROLE = keccak256("BIDDER_ROLE");
+
+    // Implementation contract address
+    address public tenderImplementation;
+
+    // Events for implementation management
+    event ImplementationUpdated(address indexed oldImplementation, address indexed newImplementation);
+
+    // Constants
+    uint256 public constant REPUTATION_MAX_SCORE = 100;
+    uint256 public constant MIN_STAKE_AMOUNT = 0.1 ether; // Minimum stake required in ETH
+
+    struct UserProfile {
+        string metadata;           // IPFS hash containing user details
+        uint256 reputation;        // Current reputation score
+        uint256 stakedAmount;      // Amount of ETH staked
+        EnumerableSet.AddressSet tenders; // Tenders associated with user
     }
 
-    // Reputation scores for bidders
-    mapping(address => uint256) public reputationScores;
+    struct TenderInfo {
+        address tenderContract;    // Address of deployed tender contract
+        address organization;      // Organization that created the tender
+        string ipfsHash;          // IPFS hash containing tender details
+        uint256 creationTime;     // Creation timestamp
+        bool isActive;            // Active status
+    }
+
+    struct Analytics {
+        uint256 totalBids;
+        uint256 tendersWon;
+        uint256 totalTendersParticipated;
+        uint256 averageBidAmount;
+        uint256 lastActivityTime;
+    }
+
+    // Events
+    event OrganizationRegistered(address indexed organization, string metadata);
+    event BidderRegistered(address indexed bidder, string metadata);
+    event TenderDeployed(address indexed tenderAddress, address indexed organization, string ipfsHash);
+    event ReputationUpdated(address indexed user, uint256 newScore, uint256 previousScore);
+    event StakeDeposited(address indexed user, uint256 amount);
+    event StakeWithdrawn(address indexed user, uint256 amount);
+    event UserSlashed(address indexed user, uint256 amount, string reason);
+
+    // State Variables
+    mapping(address => UserProfile) public userProfiles;
+    mapping(address => Analytics) public userAnalytics;
+    mapping(address => mapping(uint256 => uint256)) public reputationHistory;
     
-    // Organization -> their tenders
-    mapping(address => address[]) public organizationTenders;
-    
-    // Tender address -> metadata
-    mapping(address => TenderMetadata) public tenderMetadata;
-    
-    // Creation fee
-    uint256 public tenderCreationFee;
-    
-    event TenderCreated(
-        address indexed tenderAddress,
-        address indexed organization,
-        string ipfsHash
-    );
-    event ReputationUpdated(
-        address indexed bidder, 
-        uint256 newScore
-    );
-    
+    TenderInfo[] public tenders;
+    uint256 public totalStaked;
+
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() initializer {
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @dev Initialize the contract with admin and implementation
+     * @param admin Address of the initial admin
+     * @param _implementation Address of the tender implementation contract
+     */
+    function initialize(address admin, address _implementation) public initializer {
         __AccessControl_init();
         __Pausable_init();
         __ReentrancyGuard_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(ADMIN_ROLE, admin);
         
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(ADMIN_ROLE, msg.sender);
-        
-        tenderCreationFee = 0.1 ether;
+        require(_implementation != address(0), "Invalid implementation address");
+        tenderImplementation = _implementation;
+        emit ImplementationUpdated(address(0), _implementation);
     }
-    
-    function createTender(
-        string memory title,
-        string memory ipfsHash,
-        uint256 bidWeight,
-        uint256 reputationWeight,
-        uint256 startTime,
-        uint256 endTime,
-        uint256 minimumBid
-    ) external payable whenNotPaused nonReentrant returns (address) {
-        require(
-            hasRole(ORGANIZATION_ROLE, msg.sender),
-            "Must have organization role"
-        );
-        require(msg.value >= tenderCreationFee, "Insufficient fee");
+
+    /**
+     * @dev Update the implementation contract address
+     * @param newImplementation Address of the new implementation contract
+     */
+    function updateImplementation(address newImplementation) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+    {
+        require(newImplementation != address(0), "Invalid implementation address");
+        address oldImplementation = tenderImplementation;
+        tenderImplementation = newImplementation;
+        emit ImplementationUpdated(oldImplementation, newImplementation);
+    }
+
+    /**
+     * @dev Register a new organization
+     * @param organization Address of the organization
+     * @param metadata IPFS hash containing organization details
+     */
+    function registerOrganization(address organization, string calldata metadata) 
+        external 
+        payable
+        onlyRole(ADMIN_ROLE) 
+        whenNotPaused 
+    {
+        require(organization != address(0), "Invalid organization address");
+        require(!hasRole(ORGANIZATION_ROLE, organization), "Already registered");
+        require(msg.value >= MIN_STAKE_AMOUNT, "Insufficient stake amount");
         
-        TenderContract newTender = new TenderContract(
-            address(this),
-            msg.sender,
-            title,
-            ipfsHash,
-            bidWeight,
-            reputationWeight,
-            startTime,
-            endTime,
-            minimumBid
-        );
-        
-        // Update mappings
-        organizationTenders[msg.sender].push(address(newTender));
-        tenderMetadata[address(newTender)] = TenderMetadata({
-            organization: msg.sender,
-            createdAt: block.timestamp,
-            ipfsHash: ipfsHash,
-            isActive: true
+        _setupRole(ORGANIZATION_ROLE, organization);
+        userProfiles[organization] = UserProfile({
+            metadata: metadata,
+            reputation: REPUTATION_MAX_SCORE,
+            stakedAmount: msg.value,
+            tenders: EnumerableSet.AddressSet()
         });
         
-        emit TenderCreated(address(newTender), msg.sender, ipfsHash);
-        return address(newTender);
+        totalStaked += msg.value;
+        emit OrganizationRegistered(organization, metadata);
+        emit StakeDeposited(organization, msg.value);
     }
-    
-    function updateReputation(
-        address bidder,
-        uint256 newScore
-    ) external onlyRole(ADMIN_ROLE) {
-        require(newScore <= 100, "Score must be <= 100");
-        reputationScores[bidder] = newScore;
-        emit ReputationUpdated(bidder, newScore);
+
+    /**
+     * @dev Register a new bidder
+     * @param metadata IPFS hash containing bidder details
+     */
+    function registerBidder(string calldata metadata) 
+        external 
+        payable
+        nonReentrant 
+        whenNotPaused 
+    {
+        require(!hasRole(BIDDER_ROLE, msg.sender), "Already registered");
+        require(msg.value >= MIN_STAKE_AMOUNT, "Insufficient stake amount");
+        
+        _setupRole(BIDDER_ROLE, msg.sender);
+        userProfiles[msg.sender] = UserProfile({
+            metadata: metadata,
+            reputation: REPUTATION_MAX_SCORE / 2, // Start with 50% reputation
+            stakedAmount: msg.value,
+            tenders: EnumerableSet.AddressSet()
+        });
+        
+        totalStaked += msg.value;
+        emit BidderRegistered(msg.sender, metadata);
+        emit StakeDeposited(msg.sender, msg.value);
     }
-    
-    function getReputationScore(
-        address bidder
-    ) external view returns (uint256) {
-        return reputationScores[bidder];
+
+    /**
+     * @dev Deploy a new tender contract
+     * @param metadata General tender metadata
+     * @param ipfsHash IPFS hash containing detailed tender information
+     */
+    function deployTender(
+        string calldata metadata,
+        string calldata ipfsHash
+    ) 
+        external 
+        onlyRole(ORGANIZATION_ROLE) 
+        whenNotPaused 
+        nonReentrant 
+        returns (address) 
+    {
+        require(tenderImplementation != address(0), "Implementation not set");
+        address clone = _deployClone(tenderImplementation);
+        userProfiles[msg.sender].tenders.add(clone);
+        
+        tenders.push(TenderInfo({
+            tenderContract: clone,
+            organization: msg.sender,
+            ipfsHash: ipfsHash,
+            creationTime: block.timestamp,
+            isActive: true
+        }));
+        
+        emit TenderDeployed(clone, msg.sender, ipfsHash);
+        return clone;
     }
-    
-    function getOrganizationTenders(
-        address organization
-    ) external view returns (address[] memory) {
-        return organizationTenders[organization];
+
+    /**
+     * @dev Update user reputation
+     * @param user Address of the user
+     * @param newScore New reputation score
+     */
+    function updateReputation(address user, uint256 newScore) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+    {
+        require(newScore <= REPUTATION_MAX_SCORE, "Score exceeds maximum");
+        UserProfile storage profile = userProfiles[user];
+
+        uint256 previousScore = profile.reputation;
+        profile.reputation = newScore;
+        
+        // Store in history
+        reputationHistory[user][block.timestamp] = newScore;
+        
+        emit ReputationUpdated(user, newScore, previousScore);
     }
-    
-    function setTenderCreationFee(
-        uint256 newFee
-    ) external onlyRole(ADMIN_ROLE) {
-        tenderCreationFee = newFee;
+
+    /**
+     * @dev Increase stake amount
+     */
+    function increaseStake() 
+        external 
+        payable
+        nonReentrant 
+        whenNotPaused 
+    {
+        require(msg.value > 0, "Amount must be positive");
+        
+        userProfiles[msg.sender].stakedAmount += msg.value;
+        totalStaked += msg.value;
+        
+        emit StakeDeposited(msg.sender, msg.value);
     }
-    
+
+    /**
+     * @dev Withdraw staked ETH
+     * @param amount Amount of ETH to withdraw
+     */
+    function withdrawStake(uint256 amount) 
+        external 
+        nonReentrant 
+        whenNotPaused 
+    {
+        UserProfile storage profile = userProfiles[msg.sender];
+        require(amount <= profile.stakedAmount, "Insufficient stake");
+        
+        profile.stakedAmount -= amount;
+        totalStaked -= amount;
+        
+        (bool success, ) = msg.sender.call{value: amount}("");
+        require(success, "ETH transfer failed");
+        
+        emit StakeWithdrawn(msg.sender, amount);
+    }
+
+    /**
+     * @dev Slash user's stake for rule violations
+     * @param user Address of the user to slash
+     * @param amount Amount to slash
+     * @param reason Reason for slashing
+     */
+    function slashStake(
+        address user, 
+        uint256 amount, 
+        string calldata reason
+    ) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+    {
+        UserProfile storage profile = userProfiles[user];
+        require(amount <= profile.stakedAmount, "Amount exceeds stake");
+        
+        profile.stakedAmount -= amount;
+        totalStaked -= amount;
+        
+        emit UserSlashed(user, amount, reason);
+    }
+
+    /**
+     * @dev Update user analytics
+     * @param user Address of the user
+     * @param bidAmount Bid amount
+     * @param wonTender Whether the user won the tender
+     */
+    function updateAnalytics(
+        address user,
+        uint256 bidAmount,
+        bool wonTender
+    ) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+    {
+        Analytics storage analytics = userAnalytics[user];
+        analytics.totalBids++;
+        if (wonTender) {
+            analytics.tendersWon++;
+        }
+        analytics.totalTendersParticipated++;
+        analytics.averageBidAmount = (analytics.averageBidAmount * (analytics.totalBids - 1) + bidAmount) / analytics.totalBids;
+        analytics.lastActivityTime = block.timestamp;
+    }
+
+    // View Functions
+    /**
+     * @dev Get user profile information
+     * @param user Address of the user
+     */
+    function getUserProfile(address user) 
+        external 
+        view 
+        returns (
+            string memory metadata,
+            uint256 reputation,
+            uint256 stakedAmount
+        ) 
+    {
+        UserProfile storage profile = userProfiles[user];
+        return (
+            profile.metadata,
+            profile.reputation,
+            profile.stakedAmount
+        );
+    }
+
+    /**
+     * @dev Get user's tenders
+     * @param user Address of the user
+     */
+    function getUserTenders(address user) 
+        external 
+        view 
+        returns (address[] memory) 
+    {
+        return userProfiles[user].tenders.values();
+    }
+
+    /**
+     * @dev Get all tenders
+     */
+    function getAllTenders() 
+        external 
+        view 
+        returns (TenderInfo[] memory) 
+    {
+        return tenders;
+    }
+
+    /**
+     * @dev Get user analytics
+     * @param user Address of the user
+     */
+    function getUserAnalytics(address user) 
+        external 
+        view 
+        returns (
+            uint256 totalBids,
+            uint256 tendersWon,
+            uint256 totalTendersParticipated,
+            uint256 averageBidAmount,
+            uint256 lastActivityTime
+        ) 
+    {
+        Analytics storage analytics = userAnalytics[user];
+        return (
+            analytics.totalBids,
+            analytics.tendersWon,
+            analytics.totalTendersParticipated,
+            analytics.averageBidAmount,
+            analytics.lastActivityTime
+        );
+    }
+
+    /**
+     * @dev Internal function to deploy a clone of the tender implementation
+     * @param implementation Address of the implementation contract
+     */
+    function _deployClone(address implementation) 
+        internal 
+        returns (address) 
+    {
+        bytes20 implementationBytes = bytes20(implementation);
+        address clone;
+        
+        assembly {
+            let ptr := mload(0x40)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)
+            mstore(add(ptr, 0x14), implementationBytes)
+            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)
+            clone := create(0, ptr, 0x37)
+        }
+        
+        return clone;
+    }
+
+    // Admin Functions
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
     }
-    
+
     function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
     }
-    
-    // Allow contract to receive ETH
-    receive() external payable {}
+
+    // Add receive function to accept ETH
+    receive() external payable {
+        revert("Direct ETH transfers not allowed");
+    }
+
+    // Add fallback function
+    fallback() external payable {
+        revert("Direct ETH transfers not allowed");
+    }
 } 
