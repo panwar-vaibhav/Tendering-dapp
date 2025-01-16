@@ -171,10 +171,20 @@ contract FactoryContract is
      * @dev Deploy a new tender contract
      * @param metadata General tender metadata
      * @param ipfsHash IPFS hash containing detailed tender information
+     * @param startTime Start time for the tender
+     * @param endTime End time for the tender
+     * @param minimumBid Minimum bid amount
+     * @param bidWeight Weight for bid amount in scoring (0-100)
+     * @param reputationWeight Weight for reputation in scoring (0-100)
      */
     function deployTender(
         string calldata metadata,
-        string calldata ipfsHash
+        string calldata ipfsHash,
+        uint256 startTime,
+        uint256 endTime,
+        uint256 minimumBid,
+        uint256 bidWeight,
+        uint256 reputationWeight
     ) 
         external 
         onlyRole(ORGANIZATION_ROLE) 
@@ -183,9 +193,26 @@ contract FactoryContract is
         returns (address) 
     {
         require(tenderImplementation != address(0), "Implementation not set");
-        address clone = _deployClone(tenderImplementation);
-        userProfiles[msg.sender].tenders.add(clone);
+        require(startTime >= block.timestamp, "Start time must be future");
+        require(endTime > startTime, "Invalid end time");
+        require(bidWeight + reputationWeight == 100, "Invalid weights");
         
+        // Deploy clone
+        address clone = _deployClone(tenderImplementation);
+        
+        // Initialize the clone
+        TenderContract(clone).initialize(
+            msg.sender,
+            ipfsHash,
+            startTime,
+            endTime,
+            minimumBid,
+            bidWeight,
+            reputationWeight
+        );
+        
+        // Update user profile and tender list
+        userProfiles[msg.sender].tenders.add(clone);
         tenders.push(TenderInfo({
             tenderContract: clone,
             organization: msg.sender,
@@ -196,6 +223,57 @@ contract FactoryContract is
         
         emit TenderDeployed(clone, msg.sender, ipfsHash);
         return clone;
+    }
+
+    /**
+     * @dev Update analytics after tender completion
+     * @param winner Address of the winning bidder
+     * @param amount Winning bid amount
+     * @param success Whether the tender was successfully completed
+     */
+    function updateAnalytics(
+        address winner,
+        uint256 amount,
+        bool success
+    ) 
+        external 
+    {
+        // Only allow calls from deployed tender contracts
+        bool isTenderContract = false;
+        for (uint256 i = 0; i < tenders.length; i++) {
+            if (tenders[i].tenderContract == msg.sender) {
+                isTenderContract = true;
+                break;
+            }
+        }
+        require(isTenderContract, "Caller not a tender contract");
+
+        // Update winner analytics
+        if (success && winner != address(0)) {
+            Analytics storage analytics = userAnalytics[winner];
+            analytics.tendersWon++;
+            analytics.totalBids++;
+            analytics.totalTendersParticipated++;
+            
+            // Update average bid amount
+            if (analytics.averageBidAmount == 0) {
+                analytics.averageBidAmount = amount;
+            } else {
+                analytics.averageBidAmount = (analytics.averageBidAmount + amount) / 2;
+            }
+            
+            analytics.lastActivityTime = block.timestamp;
+            
+            // Update reputation if needed
+            if (userProfiles[winner].reputation < REPUTATION_MAX_SCORE) {
+                userProfiles[winner].reputation += 1;
+                emit ReputationUpdated(
+                    winner,
+                    userProfiles[winner].reputation,
+                    userProfiles[winner].reputation - 1
+                );
+            }
+        }
     }
 
     /**
@@ -302,6 +380,32 @@ contract FactoryContract is
         analytics.totalTendersParticipated++;
         analytics.averageBidAmount = (analytics.averageBidAmount * (analytics.totalBids - 1) + bidAmount) / analytics.totalBids;
         analytics.lastActivityTime = block.timestamp;
+    }
+
+    /**
+     * @dev Activate a deployed tender for bidding
+     * @param tenderAddress Address of the tender to activate
+     */
+    function activateTender(address tenderAddress) 
+        external 
+        onlyRole(ORGANIZATION_ROLE)
+        whenNotPaused
+        nonReentrant
+    {
+        require(tenderAddress != address(0), "Invalid tender address");
+        
+        bool found = false;
+        for (uint256 i = 0; i < tenders.length; i++) {
+            if (tenders[i].tenderContract == tenderAddress) {
+                require(tenders[i].organization == msg.sender, "Not tender owner");
+                require(tenders[i].isActive, "Tender not active in factory");
+                found = true;
+                break;
+            }
+        }
+        require(found, "Tender not found");
+        
+        TenderContract(tenderAddress).activate();
     }
 
     // View Functions
