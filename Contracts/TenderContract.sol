@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
-import "./FactoryContract.sol";
+import "./IFactoryContract.sol";
 
 /**
  * @title TenderContract
@@ -74,7 +74,7 @@ contract TenderContract is ReentrancyGuard, Pausable {
 
     // State Variables
     /// @dev Reference to factory contract
-    FactoryContract public immutable factory;
+    IFactoryContract public immutable factory;
     /// @dev Main tender information
     TenderDetails public tenderDetails;
     /// @dev Total stakes held by contract
@@ -180,7 +180,7 @@ contract TenderContract is ReentrancyGuard, Pausable {
             _factory != address(0),
             "Input error: Factory address cannot be zero"
         );
-        factory = FactoryContract(_factory);
+        factory = IFactoryContract(_factory);
     }
 
     /**
