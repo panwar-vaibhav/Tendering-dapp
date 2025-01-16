@@ -6,6 +6,7 @@ import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol"
 import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import "./TenderContract.sol";
 
 /**
  * @title FactoryContract
@@ -128,7 +129,7 @@ contract FactoryContract is
         require(!hasRole(ORGANIZATION_ROLE, organization), "Already registered");
         require(msg.value >= MIN_STAKE_AMOUNT, "Insufficient stake amount");
         
-        _setupRole(ORGANIZATION_ROLE, organization);
+        grantRole(ORGANIZATION_ROLE, organization);
         userProfiles[organization] = UserProfile({
             metadata: metadata,
             reputation: REPUTATION_MAX_SCORE,
@@ -154,7 +155,7 @@ contract FactoryContract is
         require(!hasRole(BIDDER_ROLE, msg.sender), "Already registered");
         require(msg.value >= MIN_STAKE_AMOUNT, "Insufficient stake amount");
         
-        _setupRole(BIDDER_ROLE, msg.sender);
+        grantRole(BIDDER_ROLE, msg.sender);
         userProfiles[msg.sender] = UserProfile({
             metadata: metadata,
             reputation: REPUTATION_MAX_SCORE / 2, // Start with 50% reputation
