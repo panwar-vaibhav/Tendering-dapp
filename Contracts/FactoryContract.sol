@@ -41,7 +41,6 @@ contract FactoryContract is
         string metadata;           // IPFS hash containing user details
         uint256 reputation;        // Current reputation score
         uint256 stakedAmount;      // Amount of ETH staked
-        EnumerableSet.AddressSet tenders; // Tenders associated with user
     }
 
     struct TenderInfo {
@@ -70,9 +69,10 @@ contract FactoryContract is
     event UserSlashed(address indexed user, uint256 amount, string reason);
 
     // State Variables
-    mapping(address => UserProfile) public userProfiles;
+    mapping(address => UserProfile) private userProfiles;
     mapping(address => Analytics) public userAnalytics;
     mapping(address => mapping(uint256 => uint256)) public reputationHistory;
+    mapping(address => EnumerableSet.AddressSet) private userTenders;
     
     TenderInfo[] public tenders;
     uint256 public totalStaked;
@@ -130,12 +130,10 @@ contract FactoryContract is
         require(msg.value >= MIN_STAKE_AMOUNT, "Insufficient stake amount");
         
         grantRole(ORGANIZATION_ROLE, organization);
-        userProfiles[organization] = UserProfile({
-            metadata: metadata,
-            reputation: REPUTATION_MAX_SCORE,
-            stakedAmount: msg.value,
-            tenders: EnumerableSet.AddressSet()
-        });
+        
+        userProfiles[organization].metadata = metadata;
+        userProfiles[organization].reputation = REPUTATION_MAX_SCORE;
+        userProfiles[organization].stakedAmount = msg.value;
         
         totalStaked += msg.value;
         emit OrganizationRegistered(organization, metadata);
@@ -156,12 +154,10 @@ contract FactoryContract is
         require(msg.value >= MIN_STAKE_AMOUNT, "Insufficient stake amount");
         
         grantRole(BIDDER_ROLE, msg.sender);
-        userProfiles[msg.sender] = UserProfile({
-            metadata: metadata,
-            reputation: REPUTATION_MAX_SCORE / 2, // Start with 50% reputation
-            stakedAmount: msg.value,
-            tenders: EnumerableSet.AddressSet()
-        });
+        
+        userProfiles[msg.sender].metadata = metadata;
+        userProfiles[msg.sender].reputation = REPUTATION_MAX_SCORE / 2;
+        userProfiles[msg.sender].stakedAmount = msg.value;
         
         totalStaked += msg.value;
         emit BidderRegistered(msg.sender, metadata);
@@ -213,7 +209,7 @@ contract FactoryContract is
         );
         
         // Update user profile and tender list
-        userProfiles[msg.sender].tenders.add(clone);
+        addUserTender(msg.sender, clone);
         tenders.push(TenderInfo({
             tenderContract: clone,
             organization: msg.sender,
@@ -440,7 +436,7 @@ contract FactoryContract is
         view 
         returns (address[] memory) 
     {
-        return userProfiles[user].tenders.values();
+        return EnumerableSet.values(userTenders[user]);
     }
 
     /**
@@ -518,5 +514,10 @@ contract FactoryContract is
     // Add fallback function
     fallback() external payable {
         revert("Direct ETH transfers not allowed");
+    }
+
+    // Add a function to manage user tenders
+    function addUserTender(address user, address tenderAddress) internal {
+        EnumerableSet.add(userTenders[user], tenderAddress);
     }
 } 
