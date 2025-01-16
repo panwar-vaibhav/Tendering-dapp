@@ -337,7 +337,7 @@ contract TenderContract is ReentrancyGuard, Pausable {
             
             if (bid.status != BidStatus.Active) continue;
 
-            (,uint256 reputation,,,,) = factory.getUserProfile(bidder);
+            (, uint256 reputation,) = factory.getUserProfile(bidder);
             
             // Add score overflow protection
             require(bid.amount <= type(uint256).max / 100, "Bid amount too high for scoring");
