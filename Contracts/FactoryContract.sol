@@ -7,12 +7,13 @@ import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "./TenderContract.sol";
+import "./FactoryLibrary.sol";
 
 /**
  * @title FactoryContract
- * @dev Main factory contract for managing tenders, user roles, and platform operations
- * @notice This contract handles user registration, tender deployment, reputation management,
- * and stake management for the decentralized tendering platform
+ * @dev Main factory contract for managing tenders, user roles, and platform operations.
+ * This contract handles user registration, tender deployment, reputation management,
+ * and stake management for the decentralized tendering platform.
  */
 contract FactoryContract is 
     Initializable, 
@@ -21,6 +22,8 @@ contract FactoryContract is
     ReentrancyGuardUpgradeable 
 {
     using EnumerableSet for EnumerableSet.AddressSet;
+    using FactoryLibrary for FactoryLibrary.Analytics;
+    using FactoryLibrary for FactoryLibrary.UserProfile;
 
     // Role definitions
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
@@ -37,26 +40,21 @@ contract FactoryContract is
     uint256 public constant REPUTATION_MAX_SCORE = 100;
     uint256 public constant MIN_STAKE_AMOUNT = 0.1 ether; // Minimum stake required in ETH
 
-    struct UserProfile {
-        string metadata;           // IPFS hash containing user details
-        uint256 reputation;        // Current reputation score
-        uint256 stakedAmount;      // Amount of ETH staked
+    struct TenderMetadata {
+        string name;              // Name/title of the tender
+        string organization;      // Organization name
+        string category;          // Category/type of tender
+        string briefDescription;  // One-line description
+        string contactInfo;       // Basic contact information
     }
 
     struct TenderInfo {
         address tenderContract;    // Address of deployed tender contract
         address organization;      // Organization that created the tender
-        string ipfsHash;          // IPFS hash containing tender details
+        TenderMetadata metadata;   // Basic tender metadata
+        string ipfsHash;          // IPFS hash containing complete tender documents
         uint256 creationTime;     // Creation timestamp
         bool isActive;            // Active status
-    }
-
-    struct Analytics {
-        uint256 totalBids;
-        uint256 tendersWon;
-        uint256 totalTendersParticipated;
-        uint256 averageBidAmount;
-        uint256 lastActivityTime;
     }
 
     // Events
@@ -69,8 +67,8 @@ contract FactoryContract is
     event UserSlashed(address indexed user, uint256 amount, string reason);
 
     // State Variables
-    mapping(address => UserProfile) private userProfiles;
-    mapping(address => Analytics) public userAnalytics;
+    mapping(address => FactoryLibrary.UserProfile) private userProfiles;
+    mapping(address => FactoryLibrary.Analytics) private userAnalytics;
     mapping(address => mapping(uint256 => uint256)) public reputationHistory;
     mapping(address => EnumerableSet.AddressSet) private userTenders;
     
@@ -95,23 +93,9 @@ contract FactoryContract is
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(ADMIN_ROLE, admin);
         
-        require(_implementation != address(0), "Invalid implementation address");
+        require(_implementation != address(0), "Invalid impl");
         tenderImplementation = _implementation;
         emit ImplementationUpdated(address(0), _implementation);
-    }
-
-    /**
-     * @dev Update the implementation contract address
-     * @param newImplementation Address of the new implementation contract
-     */
-    function updateImplementation(address newImplementation) 
-        external 
-        onlyRole(ADMIN_ROLE) 
-    {
-        require(newImplementation != address(0), "Invalid implementation address");
-        address oldImplementation = tenderImplementation;
-        tenderImplementation = newImplementation;
-        emit ImplementationUpdated(oldImplementation, newImplementation);
     }
 
     /**
@@ -125,9 +109,9 @@ contract FactoryContract is
         onlyRole(ADMIN_ROLE) 
         whenNotPaused 
     {
-        require(organization != address(0), "Invalid organization address");
-        require(!hasRole(ORGANIZATION_ROLE, organization), "Already registered");
-        require(msg.value >= MIN_STAKE_AMOUNT, "Insufficient stake amount");
+        require(organization != address(0), "Invalid org");
+        require(!hasRole(ORGANIZATION_ROLE, organization), "Registered");
+        FactoryLibrary.validateStake(msg.value, MIN_STAKE_AMOUNT);
         
         grantRole(ORGANIZATION_ROLE, organization);
         
@@ -166,16 +150,17 @@ contract FactoryContract is
 
     /**
      * @dev Deploy a new tender contract
-     * @param metadata General tender metadata
-     * @param ipfsHash IPFS hash containing detailed tender information
+     * @param metadata TenderMetadata struct containing basic tender information
+     * @param ipfsHash IPFS hash containing complete tender documentation
      * @param startTime Start time for the tender
      * @param endTime End time for the tender
      * @param minimumBid Minimum bid amount
      * @param bidWeight Weight for bid amount in scoring (0-100)
      * @param reputationWeight Weight for reputation in scoring (0-100)
+     * @return Address of the deployed tender contract
      */
     function deployTender(
-        string calldata metadata,
+        TenderMetadata calldata metadata,
         string calldata ipfsHash,
         uint256 startTime,
         uint256 endTime,
@@ -187,17 +172,14 @@ contract FactoryContract is
         onlyRole(ORGANIZATION_ROLE) 
         whenNotPaused 
         nonReentrant 
-        returns (address) 
+        returns (address payable) 
     {
-        require(tenderImplementation != address(0), "Implementation not set");
-        require(startTime >= block.timestamp, "Start time must be future");
-        require(endTime > startTime, "Invalid end time");
-        require(bidWeight + reputationWeight == 100, "Invalid weights");
+        require(tenderImplementation != address(0), "No impl");
+        require(bytes(metadata.name).length > 0, "No name");
+        require(bytes(metadata.category).length > 0, "No category");
         
-        // Deploy clone
-        address clone = _deployClone(tenderImplementation);
+        address payable clone = FactoryLibrary.deployClone(tenderImplementation);
         
-        // Initialize the clone
         TenderContract(clone).initialize(
             msg.sender,
             ipfsHash,
@@ -208,11 +190,11 @@ contract FactoryContract is
             reputationWeight
         );
         
-        // Update user profile and tender list
         addUserTender(msg.sender, clone);
         tenders.push(TenderInfo({
             tenderContract: clone,
             organization: msg.sender,
+            metadata: metadata,
             ipfsHash: ipfsHash,
             creationTime: block.timestamp,
             isActive: true
@@ -235,7 +217,6 @@ contract FactoryContract is
     ) 
         external 
     {
-        // Only allow calls from deployed tender contracts
         bool isTenderContract = false;
         for (uint256 i = 0; i < tenders.length; i++) {
             if (tenders[i].tenderContract == msg.sender) {
@@ -243,25 +224,11 @@ contract FactoryContract is
                 break;
             }
         }
-        require(isTenderContract, "Caller not a tender contract");
+        require(isTenderContract, "Not tender");
 
-        // Update winner analytics
         if (success && winner != address(0)) {
-            Analytics storage analytics = userAnalytics[winner];
-            analytics.tendersWon++;
-            analytics.totalBids++;
-            analytics.totalTendersParticipated++;
+            FactoryLibrary.updateAnalytics(userAnalytics[winner], amount, true);
             
-            // Update average bid amount
-            if (analytics.averageBidAmount == 0) {
-                analytics.averageBidAmount = amount;
-            } else {
-                analytics.averageBidAmount = (analytics.averageBidAmount + amount) / 2;
-            }
-            
-            analytics.lastActivityTime = block.timestamp;
-            
-            // Update reputation if needed
             if (userProfiles[winner].reputation < REPUTATION_MAX_SCORE) {
                 userProfiles[winner].reputation += 1;
                 emit ReputationUpdated(
@@ -283,7 +250,7 @@ contract FactoryContract is
         onlyRole(ADMIN_ROLE) 
     {
         require(newScore <= REPUTATION_MAX_SCORE, "Score exceeds maximum");
-        UserProfile storage profile = userProfiles[user];
+        FactoryLibrary.UserProfile storage profile = userProfiles[user];
 
         uint256 previousScore = profile.reputation;
         profile.reputation = newScore;
@@ -320,7 +287,7 @@ contract FactoryContract is
         nonReentrant 
         whenNotPaused 
     {
-        UserProfile storage profile = userProfiles[msg.sender];
+        FactoryLibrary.UserProfile storage profile = userProfiles[msg.sender];
         require(amount <= profile.stakedAmount, "Insufficient stake");
         
         profile.stakedAmount -= amount;
@@ -346,7 +313,7 @@ contract FactoryContract is
         external 
         onlyRole(ADMIN_ROLE) 
     {
-        UserProfile storage profile = userProfiles[user];
+        FactoryLibrary.UserProfile storage profile = userProfiles[user];
         require(amount <= profile.stakedAmount, "Amount exceeds stake");
         
         profile.stakedAmount -= amount;
@@ -356,34 +323,10 @@ contract FactoryContract is
     }
 
     /**
-     * @dev Update user analytics
-     * @param user Address of the user
-     * @param bidAmount Bid amount
-     * @param wonTender Whether the user won the tender
-     */
-    function updateAnalytics(
-        address user,
-        uint256 bidAmount,
-        bool wonTender
-    ) 
-        external 
-        onlyRole(ADMIN_ROLE) 
-    {
-        Analytics storage analytics = userAnalytics[user];
-        analytics.totalBids++;
-        if (wonTender) {
-            analytics.tendersWon++;
-        }
-        analytics.totalTendersParticipated++;
-        analytics.averageBidAmount = (analytics.averageBidAmount * (analytics.totalBids - 1) + bidAmount) / analytics.totalBids;
-        analytics.lastActivityTime = block.timestamp;
-    }
-
-    /**
      * @dev Activate a deployed tender for bidding
      * @param tenderAddress Address of the tender to activate
      */
-    function activateTender(address tenderAddress) 
+    function activateTender(address payable tenderAddress) 
         external 
         onlyRole(ORGANIZATION_ROLE)
         whenNotPaused
@@ -419,7 +362,7 @@ contract FactoryContract is
             uint256 stakedAmount
         ) 
     {
-        UserProfile storage profile = userProfiles[user];
+        FactoryLibrary.UserProfile storage profile = userProfiles[user];
         return (
             profile.metadata,
             profile.reputation,
@@ -465,7 +408,7 @@ contract FactoryContract is
             uint256 lastActivityTime
         ) 
     {
-        Analytics storage analytics = userAnalytics[user];
+        FactoryLibrary.Analytics storage analytics = userAnalytics[user];
         return (
             analytics.totalBids,
             analytics.tendersWon,
@@ -473,28 +416,6 @@ contract FactoryContract is
             analytics.averageBidAmount,
             analytics.lastActivityTime
         );
-    }
-
-    /**
-     * @dev Internal function to deploy a clone of the tender implementation
-     * @param implementation Address of the implementation contract
-     */
-    function _deployClone(address implementation) 
-        internal 
-        returns (address) 
-    {
-        bytes20 implementationBytes = bytes20(implementation);
-        address clone;
-        
-        assembly {
-            let ptr := mload(0x40)
-            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)
-            mstore(add(ptr, 0x14), implementationBytes)
-            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)
-            clone := create(0, ptr, 0x37)
-        }
-        
-        return clone;
     }
 
     // Admin Functions
@@ -508,12 +429,12 @@ contract FactoryContract is
 
     // Add receive function to accept ETH
     receive() external payable {
-        revert("Direct ETH transfers not allowed");
+        revert("No direct transfers");
     }
 
     // Add fallback function
     fallback() external payable {
-        revert("Direct ETH transfers not allowed");
+        revert("No direct transfers");
     }
 
     // Add a function to manage user tenders
